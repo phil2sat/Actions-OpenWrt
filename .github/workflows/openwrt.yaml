@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: openwrt/sdk:latest
-      options: --workdir /github/workspace
+      options: --user 1000:1000 --workdir /github/workspace --privileged
 
     steps:
     - name: Checkout
