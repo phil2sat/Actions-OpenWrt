@@ -35,7 +35,9 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: openwrt/sdk:latest
-      options: --user 1000:1000 --workdir /github/workspace --privileged
+      options: --user root --workdir /github/workspace --privileged
+    env:
+      FORCE_UNSAFE_CONFIGURE: "1"
 
     steps:
     - name: Checkout
