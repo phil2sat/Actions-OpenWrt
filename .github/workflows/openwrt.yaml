@@ -34,7 +34,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     container:
-      image: openwrtorg/sdk:latest
+      image: openwrt/sdk:latest
       options: --privileged  # Wichtig für Build-Tools
 
     steps:
