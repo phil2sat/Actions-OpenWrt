@@ -1,0 +1,169 @@
+name: build bpi-r4-std openwrt
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+        - true
+        - false
+      version:
+        description: 'OpenWrt version'
+        required: true
+        default: 'snapshot'
+        type: string
+
+env:
+  REPO_URL: https://git.openwrt.org/openwrt/openwrt.git
+  REPO_BRANCH: master
+  BUILD_ROOT: ${{ github.workspace }}/openwrt
+  CUSTOM_FEEDS_SH: ${{ github.workspace }}/custom-feeds.sh
+  CUSTOM_PACKAGES_SH: ${{ github.workspace }}/custom-packages.sh
+  CUSTOM_CONFIG_SH: ${{ github.workspace }}/custom-config.sh
+  TZ: Europe/Berlin
+  DEVICE_NAME: unknown
+  FILE_DATE: unknown
+  FIRMWARE: unknown
+
+jobs:
+  build:
+    runs-on: self-hosted
+    container:
+      image: openwrt/sdk:latest
+      options: --user root --workdir /github/workspace --privileged
+    env:
+      FORCE_UNSAFE_CONFIGURE: "1"
+      CCACHE_DIR: /github/workspace/ccache
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2.18
+      with:
+        key: openwrt-ccache-${{ github.sha }}
+        restore-keys: openwrt-ccache-
+        max-size: 2G
+
+    - name: Cache OpenWrt sources and ccache
+      uses: actions/cache@v4.2.3
+      with:
+        path: |
+          ${{ env.BUILD_ROOT }}/dl
+          /github/workspace/ccache
+        key: openwrt-cache-${{ github.sha }}
+        restore-keys: |
+          openwrt-cache-
+
+    - name: Clone OpenWrt sources
+      run: |
+        git clone --branch $REPO_BRANCH $REPO_URL $BUILD_ROOT
+
+    - name: Select stable revision if requested
+      if: github.event.inputs.version == 'stable'
+      run: |
+        cd $BUILD_ROOT
+        git fetch --tags
+        git checkout $(git tag --sort=-creatordate | tail -n1)
+
+    - name: Select specific version if provided
+      if: github.event.inputs.version != '' && github.event.inputs.version != 'snapshot' && github.event.inputs.version != 'stable'
+      run: |
+        cd $BUILD_ROOT
+        git checkout ${{ github.event.inputs.version }}
+
+    - name: Prepare and load custom scripts
+      run: |
+        set -e
+        chmod +x $CUSTOM_FEEDS_SH $CUSTOM_PACKAGES_SH $CUSTOM_CONFIG_SH
+        $CUSTOM_FEEDS_SH
+        cd $BUILD_ROOT
+        ./scripts/feeds update -a && ./scripts/feeds install -a
+        $CUSTOM_PACKAGES_SH
+        $CUSTOM_CONFIG_SH
+
+    - name: Start SSH for debugging (tmate)
+      if: github.event.inputs.ssh == 'true'
+      uses: rdp-studio/ssh2actions@main
+
+    - name: Pre-download all packages (reduce build timeout)
+      run: |
+        cd $BUILD_ROOT
+        make defconfig
+        make download -j$(nproc)
+
+    - name: Build OpenWrt firmware
+      id: compile
+      run: |
+        cd $BUILD_ROOT
+        echo "Using $(nproc) threads for compilation"
+        make -j$(nproc) || make -j1 V=s
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        echo "DEVICE_NAME=$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +'%Y%m%d%H%M')" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload complete bin directory
+      if: steps.compile.outputs.status == 'success'
+      uses: actions/upload-artifact@v4
+      with:
+        name: OpenWrt_bin_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}
+        path: ${{ env.BUILD_ROOT }}/bin
+
+    - name: Organize firmware files
+      id: organize
+      run: |
+        cd $BUILD_ROOT/bin/targets/*/*
+        rm -rf packages
+        { echo '### SHA256SUMS'; echo '```txt'; cat sha256sums; echo '```'; } > $BUILD_ROOT/SHA256SUMS
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware files
+      if: steps.organize.outputs.status == 'success'
+      uses: actions/upload-artifact@v4
+      with:
+        name: OpenWrt_firmware_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      run: |
+        if [[ "${{ github.event.inputs.version }}" == "snapshot" ]]; then
+          echo "release_tag=SNAPSHOT_$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        else
+          echo "release_tag=$(cd $BUILD_ROOT && git describe --tags --abbrev=0)_$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Create GitHub release
+      if: steps.tag.outputs.status == 'success'
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        files: ${{ env.FIRMWARE }}/*
+        body_path: ${{ env.BUILD_ROOT }}/SHA256SUMS
+
+    - name: Cleanup old workflow runs
+      if: always()
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 30
+        keep_minimum_runs: 5
+
+    - name: Remove old releases
+      if: always()
+      uses: dev-drprasad/delete-older-releases@v0.3.4
+      with:
+        keep_latest: 5
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
