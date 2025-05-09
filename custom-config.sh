@@ -192,6 +192,8 @@ echo 'CONFIG_PACKAGE_kmod-veth=y' >> $BUILD_ROOT/.config
 # avoid error when: CONFIG_ALL_KMODS=y
 echo 'CONFIG_PACKAGE_kmod-thermal=y' >> $BUILD_ROOT/.config
 
+echo "CONFIG_CCACHE=y" >> $BUILD_ROOT/.config
+
 echo 'CONFIG_DEVEL=y' >> $BUILD_ROOT/.config
 echo 'CONFIG_TARGET_OPTIONS=y' >> $BUILD_ROOT/.config
 echo 'CONFIG_TARGET_OPTIMIZATION="-O3 -pipe -mcpu=cortex-a73+crc+crypto+rdma"' >> $BUILD_ROOT/.config
