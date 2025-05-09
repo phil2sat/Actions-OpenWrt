@@ -1,235 +1,271 @@
 name: build bpi-r4-std image
 
 on:
-  repository_dispatch:
-  workflow_dispatch:
+  repository_dispatch: # Ermöglicht das Auslösen durch externe Ereignisse
+  workflow_dispatch:   # Ermöglicht manuelles Auslösen mit Inputs
     inputs:
       ssh:
-        description: 'SSH connection to Actions'
+        description: 'SSH Verbindung zu Actions (tmate)'
         required: true
         default: 'false'
         type: choice
         options:
-        - true
-        - false
+        - 'true'
+        - 'false'
       version:
-        description: 'OpenWrt version'
+        description: 'OpenWrt Version (z.B. snapshot, stable, 23.05.3, v23.05.3)'
         required: true
         default: 'snapshot'
         type: string
 
-env:
+env: # Workflow-weite Umgebungsvariablen
   REPO_URL: https://git.openwrt.org/openwrt/openwrt.git
-  REPO_BRANCH: master # Wird für den initialen Klon verwendet, kann später durch Tag/Version überschrieben werden
-  # BUILD_ROOT wird dynamisch in einem späteren Schritt gesetzt, um sicherzustellen, dass es verfügbar ist
-  # CUSTOM_SCRIPTS_PATH: ${{ github.workspace }} # Pfad zu den benutzerdefinierten Skripten
+  REPO_BRANCH: master # Standard-Branch für den initialen Klon
+  OPENWRT_SUBDIR: openwrt # Name des Unterverzeichnisses für OpenWrt-Quellen
   TZ: Europe/Berlin
-  DEVICE_NAME: unknown
-  FILE_DATE: unknown
-  FIRMWARE_PATH: unknown # Wird später gesetzt
-  SHA_SUM_FILE: unknown   # Wird später gesetzt
+  # DEVICE_NAME, FILE_DATE, FIRMWARE_PATH, SHA_SUM_FILE werden dynamisch in Schritten gesetzt
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     container:
-      image: openwrt/sdk:latest
-      options: --user root --workdir /github/workspace --privileged
-    env:
-      FORCE_UNSAFE_CONFIGURE: "1"
-      # CCACHE_DIR wird hier global gesetzt und von ccache-action sowie dem Build-Prozess verwendet
+      image: openwrt/sdk:latest # Aktuelles OpenWrt SDK Docker Image
+      options: --user root --workdir /github/workspace --privileged # Container-Optionen
+
+    env: # Job-weite Umgebungsvariablen
+      FORCE_UNSAFE_CONFIGURE: "1" # Erforderlich für einige OpenWrt Builds
+      # CCACHE_DIR als Host-Pfad, da ccache-action und mkdir dies möglicherweise so erwarten/verarbeiten.
+      # ccache selbst im Container sollte diesen Pfad über das Mount korrekt auflösen können.
       CCACHE_DIR: ${{ github.workspace }}/ccache
+      # HOST_BUILD_ROOT für Operationen, die den Host-Pfad benötigen (z.B. initiales mkdir)
+      HOST_BUILD_ROOT: ${{ github.workspace }}/${{ env.OPENWRT_SUBDIR }}
+      # CONTAINER_BUILD_ROOT für working-directory und die meisten Befehle im Container
+      CONTAINER_BUILD_ROOT: /github/workspace/${{ env.OPENWRT_SUBDIR }}
 
     steps:
     - name: Checkout Workflow Repository
       uses: actions/checkout@v4
-      # Die benutzerdefinierten Skripte (custom-*.sh) werden hier ausgecheckt.
+      # Hier werden die Workflow-Datei selbst und alle benutzerdefinierten Skripte (custom-*.sh) ausgecheckt.
+      # Sie befinden sich dann im Root des /github/workspace im Container.
 
-    - name: Prepare Environment
+    - name: Prepare Environment (create directories)
       run: |
-        echo "BUILD_ROOT=${{ github.workspace }}/openwrt" >> $GITHUB_ENV
-        mkdir -p ${{ env.CCACHE_DIR }}
-        mkdir -p ${{ github.workspace }}/openwrt # Stellt sicher, dass BUILD_ROOT existiert
+        echo "Host CCACHE_DIR: ${{ env.CCACHE_DIR }}"
+        echo "Host BUILD_ROOT: ${{ env.HOST_BUILD_ROOT }}"
+        echo "Container BUILD_ROOT: ${{ env.CONTAINER_BUILD_ROOT }}"
+        mkdir -p "${{ env.CCACHE_DIR }}"
+        mkdir -p "${{ env.HOST_BUILD_ROOT }}" # Verzeichnis auf dem Host (via Mount im Container) erstellen
 
     - name: Setup ccache
-      uses: hendrikmuhs/ccache-action@v1.2 # Eine spezifische Version der Action verwenden
+      uses: hendrikmuhs/ccache-action@v1.2 # Spezifische Version der Action verwenden
       with:
         key: openwrt-ccache-${{ github.event.inputs.version }}-${{ github.ref_name }}
         restore-keys: |
           openwrt-ccache-${{ github.event.inputs.version }}-
           openwrt-ccache-
-        max-size: 2G # ccache-Größe erhöht, ggf. weiter anpassen (z.B. 5G)
-        # ccache-path ist nicht nötig, da CCACHE_DIR als Umgebungsvariable gesetzt ist
+        max-size: 2G # ccache-Größe, ggf. anpassen (z.B. 5G oder 10G für umfangreiche Builds)
 
     - name: Download OpenWrt sources
+      # Dieser Schritt läuft standardmäßig im Container-Workdir (/github/workspace)
+      # Klonen in den CONTAINER_BUILD_ROOT Pfad
       run: |
-        # Flacher Klon für Geschwindigkeit, falls nicht die volle Historie benötigt wird
-        git clone --depth 1 --branch $REPO_BRANCH $REPO_URL ${{ env.BUILD_ROOT }}
+        echo "Cloning OpenWrt from ${{ env.REPO_URL }} (branch ${{ env.REPO_BRANCH }}) into ${{ env.CONTAINER_BUILD_ROOT }}"
+        git clone --depth 1 --branch "${{ env.REPO_BRANCH }}" "${{ env.REPO_URL }}" "${{ env.CONTAINER_BUILD_ROOT }}"
+        echo "OpenWrt sources cloned."
 
     - name: Auto select stable revision
       id: autoselect
-      if: github.event.inputs.version == 'stable' # Vereinfachte Bedingung für workflow_dispatch
-      working-directory: ${{ env.BUILD_ROOT }}
+      if: github.event.inputs.version == 'stable'
+      working-directory: ${{ env.CONTAINER_BUILD_ROOT }} # Korrekten Container-Pfad verwenden
       run: |
-        git fetch --tags --unshallow # Tags holen und flachen Klon erweitern, falls nötig
+        git fetch --tags --unshallow # Erweitert flachen Klon, um alle Tags zu bekommen
         STABLE_TAG=$(git tag --sort=-creatordate | head -n1)
-        git checkout $STABLE_TAG
+        echo "Checking out stable version: $STABLE_TAG"
+        git checkout "$STABLE_TAG"
         echo "Ausgewählte stabile Version: $STABLE_TAG"
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Manual select version
       id: manualselect
+      # Bedingung: Version ist gegeben, nicht 'snapshot' und nicht 'stable' (wird von autoselect behandelt)
       if: github.event.inputs.version != null && github.event.inputs.version != 'snapshot' && github.event.inputs.version != 'stable'
-      working-directory: ${{ env.BUILD_ROOT }}
+      working-directory: ${{ env.CONTAINER_BUILD_ROOT }} # Korrekten Container-Pfad verwenden
       run: |
-        git fetch --tags --unshallow # Tags holen und flachen Klon erweitern, falls nötig
-        git checkout ${{ github.event.inputs.version }}
-        echo "Ausgewählte manuelle Version: ${{ github.event.inputs.version }}"
+        echo "Fetching tags for manual version selection..."
+        git fetch --tags --unshallow # Notwendig, falls der initiale Klon flach war
+        echo "Checking out manual version: ${{ github.event.inputs.version }}"
+        git checkout "${{ github.event.inputs.version }}"
+        echo "Ausgewählte manuelle Version: $(git describe --tags --always)"
         echo "status=success" >> $GITHUB_OUTPUT
         
     - name: Show selected OpenWrt version
-      working-directory: ${{ env.BUILD_ROOT }}
+      working-directory: ${{ env.CONTAINER_BUILD_ROOT }} # Korrekten Container-Pfad verwenden
       run: |
+        echo "Current directory: $(pwd)"
+        echo "Listing directory contents:"
+        ls -la
         echo "Aktueller OpenWrt Commit/Tag: $(git rev-parse HEAD)"
         echo "Aktuelle OpenWrt Beschreibung: $(git describe --tags --always)"
 
-    # Cache für heruntergeladene Tarballs von OpenWrt (dl-Verzeichnis)
-    # Dieser Schritt kommt NACHDEM die OpenWrt-Quellen geklont und die Version ausgewählt wurde.
     - name: Cache OpenWrt dl directory
       uses: actions/cache@v4
+      id: cache_dl
       with:
-        path: ${{ env.BUILD_ROOT }}/dl
-        key: openwrt-dl-${{ github.event.inputs.version }}-${{ hashFiles(format('{0}/feeds.conf.default', env.BUILD_ROOT)) }}
+        path: ${{ env.CONTAINER_BUILD_ROOT }}/dl # Pfad innerhalb des Containers
+        key: openwrt-dl-${{ github.event.inputs.version }}-${{ hashFiles(format('{0}/feeds.conf.default', env.CONTAINER_BUILD_ROOT)) }}
         restore-keys: |
           openwrt-dl-${{ github.event.inputs.version }}-
           openwrt-dl-
 
     - name: Load custom configurations and update feeds
+      working-directory: ${{ env.CONTAINER_BUILD_ROOT }} # Feeds-Skripte werden relativ zu diesem Pfad ausgeführt
       run: |
-        chmod +x ${{ github.workspace }}/custom-*.sh
-        # Führe Skripte aus dem Workspace-Root aus, wo sie ausgecheckt wurden
-        ${{ github.workspace }}/custom-feeds.sh
+        echo "Applying custom configurations and updating feeds..."
+        # Die benutzerdefinierten Skripte befinden sich im Workspace-Root des ausgecheckten Workflow-Repos
+        # Der Pfad zu ihnen im Container ist /github/workspace/custom-*.sh
+        chmod +x /github/workspace/custom-*.sh
         
-        cd ${{ env.BUILD_ROOT }}
+        echo "Running custom-feeds.sh"
+        /github/workspace/custom-feeds.sh
+        
+        echo "Updating feeds"
         ./scripts/feeds update -a
+        echo "Installing feeds"
         ./scripts/feeds install -a
         
-        ${{ github.workspace }}/custom-packages.sh # Diese Skripte müssen ggf. BUILD_ROOT als Parameter erwarten oder relativ zu BUILD_ROOT arbeiten
-        ${{ github.workspace }}/custom-config.sh   # z.B. cp ${{ github.workspace }}/my.config ${{ env.BUILD_ROOT }}/.config
+        echo "Running custom-packages.sh"
+        /github/workspace/custom-packages.sh
+        echo "Running custom-config.sh"
+        /github/workspace/custom-config.sh
+        echo "Custom configurations applied."
 
-    - name: Start SSH via tmate
+    - name: Start SSH via tmate (for debugging)
       uses: rdp-studio/ssh2actions@main
       if: github.event.inputs.ssh == 'true'
-      # Ggf. 'with: mode: tmate' oder andere Optionen hinzufügen
+      # Ggf. 'with: mode: tmate' oder andere Optionen hinzufügen, falls die Action dies unterstützt/benötigt
 
     - name: Build firmware
       id: compile
-      working-directory: ${{ env.BUILD_ROOT }}
+      working-directory: ${{ env.CONTAINER_BUILD_ROOT }} # Build-Prozess im OpenWrt-Verzeichnis ausführen
       run: |
-        echo "Verwende $(nproc) Threads für die Kompilierung"
-        echo "PATH: $PATH"
-        echo "CCACHE_DIR: $CCACHE_DIR"
-        echo "Überprüfe ccache Status vor dem Build:"
-        ccache -s # ccache-Statistiken vor dem Build anzeigen
+        echo "Using $(nproc) threads for compilation"
+        echo "Current PATH: $PATH"
+        echo "CCACHE_DIR: $CCACHE_DIR" # Sollte der Host-Pfad sein, den ccache (das Binary) auflösen kann
+        echo "Checking ccache status before build:"
+        ccache -s
 
-        # Sicherstellen, dass .config vorhanden und gültig ist (custom-config.sh sollte dies tun oder hier anpassen)
-        # Falls custom-config.sh keine .config erstellt, hier z.B. cp my_defconfig .config
-        make defconfig # Verarbeitet die .config, validiert sie und vervollständigt sie.
+        echo "Running make defconfig..."
+        make defconfig # Verarbeitet die .config, validiert und vervollständigt sie
         
-        echo "Lade Paketquellen herunter..."
+        echo "Downloading package sources (make download)..."
         make download -j$(nproc) # Nutzt den wiederhergestellten dl-Cache
         
-        echo "Starte Build-Prozess (world)..."
-        # Original: make -j$(nproc) defconfig download clean world || make -j1 V=s
-        # 'clean' entfernt, um ccache besser zu nutzen. 'defconfig' und 'download' bereits separat ausgeführt.
-        # Das Fallback mit `make -j1 V=s` (oder `V=sc` für noch mehr Details) ist gut für die Fehlersuche.
+        echo "Starting main build process (make world)..."
+        # Das Fallback mit `make -j1 V=sc` (oder `V=s`) ist gut für die Fehlersuche.
         make -j$(nproc) world || make -j1 V=sc
         
-        echo "ccache Status nach dem Build:"
-        ccache -s # ccache-Statistiken nach dem Build anzeigen
+        echo "ccache status after build:"
+        ccache -s
         
         echo "status=success" >> $GITHUB_OUTPUT
-        # DEVICE_NAME in den Workspace schreiben, um Konflikte mit BUILD_ROOT zu vermeiden
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > ${{ github.workspace }}/DEVICE_NAME_TEMP
-        echo "DEVICE_NAME=$(cat ${{ github.workspace }}/DEVICE_NAME_TEMP)" >> $GITHUB_ENV
+        # DEVICE_NAME in eine temporäre Datei im /github/workspace (Root des Workflow-Repos im Container) schreiben
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > /github/workspace/DEVICE_NAME_TEMP
+        echo "DEVICE_NAME=$(cat /github/workspace/DEVICE_NAME_TEMP)" >> $GITHUB_ENV
         echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        echo "Firmware build process finished."
 
-    - name: Upload bin directory
+    - name: Upload bin directory (build artifacts)
       uses: actions/upload-artifact@v4
-      if: steps.compile.outputs.status == 'success'
+      if: success() && steps.compile.outputs.status == 'success' # Nur bei Erfolg hochladen
       with:
         name: OpenWrt_bin_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}
-        path: ${{ env.BUILD_ROOT }}/bin
+        path: ${{ env.CONTAINER_BUILD_ROOT }}/bin # Pfad im Container
 
     - name: Organize files and prepare for release
       id: organize
-      if: steps.compile.outputs.status == 'success'
+      if: success() && steps.compile.outputs.status == 'success'
       run: |
-        # Finde das tatsächliche Firmware-Verzeichnis
-        # Der folgende Befehl sucht nach einem Verzeichnis unterhalb von bin/targets/*/*, das KEIN 'packages'-Verzeichnis ist
-        # oder wo 'packages' entfernt wurde.
-        FIRMWARE_DIR_CANDIDATE=$(find ${{ env.BUILD_ROOT }}/bin/targets/*/* -maxdepth 0 -type d)
-        echo "Kandidaten für Firmware-Verzeichnis: $FIRMWARE_DIR_CANDIDATE"
-        # Annahme: Es gibt nur ein solches Verzeichnis pro Build. Ggf. anpassen.
-        TARGET_FIRMWARE_DIR=$(echo "$FIRMWARE_DIR_CANDIDATE" | head -n1)
+        echo "Organizing files for release..."
+        TARGET_BINS_BASE="${{ env.CONTAINER_BUILD_ROOT }}/bin/targets"
+        # Finde das tatsächliche Firmware-Verzeichnis. Dies ist eine vereinfachte Annahme
+        # und muss möglicherweise angepasst werden, wenn mehrere Profile/Targets gebaut werden.
+        # Sucht nach dem ersten Unterverzeichnis von bin/targets/*/*, das nicht 'packages' heißt.
+        FIRMWARE_DIR_CANDIDATE=$(find $TARGET_BINS_BASE/*/* -maxdepth 0 -type d ! -name "packages" | head -n1)
 
-        if [ -z "$TARGET_FIRMWARE_DIR" ] || [ ! -d "$TARGET_FIRMWARE_DIR" ]; then
-          echo "Error: Konnte das Ziel-Firmware-Verzeichnis nicht finden."
-          exit 1
+        if [ -z "$FIRMWARE_DIR_CANDIDATE" ] || [ ! -d "$FIRMWARE_DIR_CANDIDATE" ]; then
+          echo "Error: Could not find target firmware directory under $TARGET_BINS_BASE."
+          # Alternativ, falls $TARGET_BINS_BASE selbst die Firmwares enthält (z.B. bei nur einem Target/Subtarget)
+          if [ -d "$TARGET_BINS_BASE" ] && [ -n "$(ls -A $TARGET_BINS_BASE/*.img 2>/dev/null || ls -A $TARGET_BINS_BASE/*.bin 2>/dev/null)" ]; then
+             FIRMWARE_DIR_CANDIDATE=$TARGET_BINS_BASE
+             echo "Using $TARGET_BINS_BASE as firmware directory."
+          else
+             exit 1
+          fi
         fi
-        echo "Ziel-Firmware-Verzeichnis: $TARGET_FIRMWARE_DIR"
-        cd "$TARGET_FIRMWARE_DIR"
-        rm -rf packages # Entferne das 'packages' Unterverzeichnis, falls vorhanden
+        
+        echo "Target firmware directory: $FIRMWARE_DIR_CANDIDATE"
+        cd "$FIRMWARE_DIR_CANDIDATE"
+        echo "Current directory for organizing files: $(pwd)"
+        rm -rf packages # Entferne das 'packages' Unterverzeichnis, falls vorhanden und nicht benötigt
 
-        # Erstelle SHA256SUMS im BUILD_ROOT, um Schreibprobleme zu vermeiden
-        sha256sum * > ${{ env.BUILD_ROOT }}/SHA256SUMS.txt
-        { echo '### SHA256SUMS'; echo '```txt'; cat ${{ env.BUILD_ROOT }}/SHA256SUMS.txt; echo '```'; } > ${{ env.BUILD_ROOT }}/SHA256SUMS_BODY.md
+        # Erstelle SHA256SUMS im /github/workspace (Root des Workflow-Repos im Container)
+        echo "Generating SHA256SUMS..."
+        sha256sum * > /github/workspace/SHA256SUMS.txt
+        { echo '### SHA256SUMS'; echo '```txt'; cat /github/workspace/SHA256SUMS.txt; echo '```'; } > /github/workspace/SHA256SUMS_BODY.md
         
         echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV # PWD ist jetzt das korrekte Firmware-Verzeichnis
-        echo "SHA_SUM_FILE=${{ env.BUILD_ROOT }}/SHA256SUMS_BODY.md" >> $GITHUB_ENV
+        echo "SHA_SUM_FILE=/github/workspace/SHA256SUMS_BODY.md" >> $GITHUB_ENV
+        echo "SHA_SUM_TXT_FILE=/github/workspace/SHA256SUMS.txt" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
+        echo "File organization complete."
 
-    - name: Upload firmware artifact
+    - name: Upload firmware artifact (specific images)
       uses: actions/upload-artifact@v4
-      if: steps.organize.outputs.status == 'success'
+      if: success() && steps.organize.outputs.status == 'success'
       with:
         name: OpenWrt_firmware_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE_PATH }} # Nutze den in 'organize' gesetzten Pfad
+        path: ${{ env.FIRMWARE_PATH }} # Nutze den in 'organize' gesetzten Pfad (enthält die eigentlichen Images)
 
     - name: Generate release tag
       id: tag
-      if: steps.organize.outputs.status == 'success' # Nur bei erfolgreichem Build einen Release Tag erstellen
+      if: success() && steps.organize.outputs.status == 'success' # Nur bei erfolgreichem Build einen Release Tag erstellen
       run: |
         OPENWRT_VERSION_DESC=""
-        CURRENT_OPENWRT_VERSION_RAW=$(cd ${{ env.BUILD_ROOT }} && git describe --tags --always)
+        # Hole die Beschreibung aus dem OpenWrt Git-Repo
+        CURRENT_OPENWRT_VERSION_RAW=$(cd ${{ env.CONTAINER_BUILD_ROOT }} && git describe --tags --always)
 
         if [[ "${{ github.event.inputs.version }}" == "snapshot" ]]; then
           # Für Snapshots einen kurzen Hash der OpenWrt-Version verwenden
-          SHORT_HASH=$(echo "$CURRENT_OPENWRT_VERSION_RAW" | cut -d'-' -f1-2) # Nimmt Tag-gSHA oder nur SHA
+          # Nimmt Tag-gSHA oder nur SHA, falls kein Tag existiert
+          SHORT_HASH=$(echo "$CURRENT_OPENWRT_VERSION_RAW" | sed 's/-g[0-9a-f]*$//' | sed 's/^v//') 
           OPENWRT_VERSION_DESC="SNAPSHOT-${SHORT_HASH}"
         else
-          # Für Releases den OpenWrt-Tag verwenden
-          OPENWRT_VERSION_DESC=$(cd ${{ env.BUILD_ROOT }} && git describe --tags --abbrev=0)
+          # Für Releases den OpenWrt-Tag verwenden (ohne 'v' Prefix, falls vorhanden)
+          OPENWRT_VERSION_DESC=$(cd ${{ env.CONTAINER_BUILD_ROOT }} && git describe --tags --abbrev=0 | sed 's/^v//')
         fi
-        # Ersetze / durch _ für gültige Tag-Namen
-        SANITIZED_OPENWRT_DESC=$(echo "$OPENWRT_VERSION_DESC" | tr '/' '_')
-        echo "release_tag=${SANITIZED_OPENWRT_DESC}_${{ env.FILE_DATE }}" >> $GITHUB_OUTPUT
+        # Ersetze / und andere ungültige Zeichen durch _ für gültige Tag-Namen
+        SANITIZED_OPENWRT_DESC=$(echo "$OPENWRT_VERSION_DESC" | tr '/' '_' | sed 's/[^a-zA-Z0-9._-]//g')
+        FINAL_TAG_NAME="${SANITIZED_OPENWRT_DESC}_${{ env.FILE_DATE }}"
+        echo "Generated Release Tag: $FINAL_TAG_NAME"
+        echo "release_tag=${FINAL_TAG_NAME}" >> $GITHUB_OUTPUT
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Create Release
       uses: softprops/action-gh-release@v1
-      if: steps.tag.outputs.status == 'success'
+      if: success() && steps.tag.outputs.status == 'success'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
+        name: "OpenWrt ${{ steps.tag.outputs.release_tag }} for ${{ env.DEVICE_NAME }}"
         files: |
           ${{ env.FIRMWARE_PATH }}/*
-          ${{ env.BUILD_ROOT }}/SHA256SUMS.txt
+          ${{ env.SHA_SUM_TXT_FILE }}
         body_path: ${{ env.SHA_SUM_FILE }}
+        # prerelease: ${{ github.event.inputs.version == 'snapshot' || contains(github.event.inputs.version, 'rc') }} # Optional: als Vorabversion markieren
 
     - name: Cleanup old workflow runs
-      if: always() # Wird immer ausgeführt, auch bei Fehlern
+      if: always() # Wird immer ausgeführt, auch bei Fehlern in vorherigen Schritten
       uses: Mattraks/delete-workflow-runs@main
       with:
         token: ${{ secrets.GITHUB_TOKEN }} # Token explizit übergeben
