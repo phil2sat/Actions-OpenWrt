@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: openwrt/sdk:latest
-      options: --privileged  # Wichtig für Build-Tools
+      options: --user root --workdir /github/workspace
 
     steps:
     - name: Checkout
