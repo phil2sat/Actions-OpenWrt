@@ -1,4 +1,4 @@
-name: Build with OpenWrt/SDK
+name: build bpi-r4-std image
 
 on:
   repository_dispatch:
